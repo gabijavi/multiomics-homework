@@ -1,0 +1,179 @@
+# HW3 Multi-omics Integration Project
+
+Author: Gabija Vidrinskaitė
+
+## Project Overview
+
+This project contains the analysis for HW3, which integrates three molecular data layers for esophageal squamous cell carcinoma (ESCC):
+
+1. RNA-seq differential gene expression and normalized VST expression values.
+2. DNA methylation data, including CpG beta values and DMRs.
+3. Normal esophageal tissue chromatin data from ENCODE: H3K27ac and H3K27me3 peaks/signals.
+
+The main biological question is whether methylation changes in ESCC preferentially affect regulatory regions that are active or repressed in normal tissue, and whether nearby genes show concordant expression changes and pathway enrichment.
+
+## Main Output
+
+The final report is:
+
+```text
+reports/HW3_multi_omics_report.html
+```
+
+The source R Markdown file for the report is:
+
+```text
+reports/HW3_multi_omics_report.Rmd
+```
+
+The report is written in a question-answer structure matching the assignment. It includes data inspection, expression and methylation distribution plots, DMR/chromatin overlap analysis, GO enrichment, IGV screenshots, and an EnrichedHeatmap-style multi-omics figure.
+
+## Folder Structure
+
+```text
+DATA/             # Provided input data files
+TASKS/            # Original homework task document
+reports/          # Final HTML report and report Rmd source
+results/          # Generated figures and IGV files
+scripts/          # Helper R scripts used for checking files and preparing IGV inputs
+colleague_work/   # Reference files from colleague, used only for visual comparison
+tools/            # Local IGV/Java tools used to create IGV screenshots
+```
+
+## Input Data
+
+The analysis uses these supplied data files:
+
+```text
+DATA/DEG_All_Genes.csv
+DATA/VST_data.csv
+DATA/dmr.bed
+DATA/CGI_hg19
+DATA/E079_15_coreMarks_mnemonics.bed.gz
+DATA/ENCFF646OKL.bed.gz
+DATA/ENCFF179UDS.bed.gz
+DATA/ENCFF075TZQ.bigWig
+DATA/ENCFF937OKW.bigWig
+DATA/GSM4505857_N2_CpG_methylation.bed.gz
+DATA/GSM4505863_N12_CpG_methylation.bed.gz
+DATA/GSM4505867_T2_CpG_methylation.bed.gz
+DATA/GSM4505873_T12_CpG_methylation.bed.gz
+```
+
+Important file mapping:
+
+- `ENCFF646OKL.bed.gz` is used as the H3K27ac peak file.
+- `ENCFF075TZQ.bigWig` is used as the H3K27ac signal file.
+- `ENCFF179UDS.bed.gz` is used as the H3K27me3 peak file.
+- `ENCFF937OKW.bigWig` is used as the H3K27me3 signal file.
+
+This mapping was checked with `scripts/map_signal_files.R` by comparing each bigWig signal over each peak set. The H3K27ac signal was strongest over H3K27ac peaks, and the H3K27me3 signal was strongest over H3K27me3 peaks, so the tracks were not swapped.
+
+No ATAC-seq bigWig was present in the supplied `DATA` folder. Because of this, the report does not claim to show ATAC signal. The IGV/browser-style plots show the available H3K27ac, H3K27me3, DMR, gene, and regulatory-state information.
+
+## Key Data Counts
+
+You have:
+
+- Genes = 20,952.
+- CpGs = 18,471,771 per CpG beta-value file.
+- DMR file lines = 2,767,129. This includes the header line, so the number of actual DMR records is 2,767,128.
+- H3K27ac peaks = 112,823.
+- H3K27me3 peaks = 9,648.
+
+## Main Analysis Steps
+
+The analysis performs:
+
+1. Data inspection and file count reporting.
+2. VST expression distribution plotting for all expression samples.
+3. Methylation beta-value distribution plotting for selected chromosomes.
+4. DMR overlap analysis with H3K27ac and H3K27me3 peaks.
+5. Linking DMRs to nearby genes and checking concordance with differential expression.
+6. GO Biological Process enrichment for nearby downregulated genes linked to hypermethylated H3K27ac-overlapping DMRs.
+7. IGV screenshot generation for two selected loci.
+8. EnrichedHeatmap visualization of chromatin signal, peak density, methylation signal, promoter methylation, and gene log2 fold change.
+
+## Main Results
+
+The analysis found:
+
+- 43,427 hypermethylated DMRs overlapping H3K27ac peaks.
+- 2,361 hypermethylated DMRs overlapping H3K27me3 peaks.
+- 17,841 H3K27ac-overlapping hypermethylated DMRs with a nearby significantly downregulated gene within 50 kb.
+- 473 H3K27me3-overlapping hypermethylated DMRs with a nearby significantly downregulated gene within 50 kb.
+
+These results support that ESCC hypermethylation affects both normally active regulatory elements and regions already marked by repression, with a stronger signal for hypermethylation at normally active H3K27ac-marked regions.
+
+## IGV Loci
+
+The selected IGV/browser-style examples are:
+
+1. `chr20:57845729-57905728`
+   - Active H3K27ac-marked locus.
+   - Hypermethylated DMR.
+   - Nearby gene: `EDN3`.
+   - `log2FC = -7.087058`, adjusted p-value `4.411848e-37`.
+
+2. `chr3:157782965-157842964`
+   - H3K27me3-marked/repressed locus.
+   - Hypermethylated DMR.
+   - Nearby gene: `SHOX2`.
+   - `log2FC = 5.156810`, adjusted p-value `7.522320e-20`.
+
+The fixed same-size IGV screenshots are stored in:
+
+```text
+results/igv/igv_locus1_active_hyper_down_fixed.png
+results/igv/igv_locus2_repressed_hyper_fixed.png
+```
+
+## Helper Scripts
+
+```text
+scripts/map_signal_files.R
+scripts/select_igv_loci.R
+scripts/prepare_igv_inputs.R
+```
+
+- `map_signal_files.R` checks whether the H3K27ac and H3K27me3 signal files match the correct peak files.
+- `select_igv_loci.R` selects representative loci for IGV screenshots.
+- `prepare_igv_inputs.R` creates the colored DMR BED file and IGV batch/session files.
+
+## Re-rendering the Report
+
+On this computer, R is installed at:
+
+```text
+C:/Program Files/R/R-4.5.3/bin/Rscript.exe
+```
+
+To re-render the report from PowerShell:
+
+```powershell
+$env:RSTUDIO_PANDOC = "C:\Program Files\RStudio\resources\app\bin\quarto\bin\tools"
+& "C:\Program Files\R\R-4.5.3\bin\Rscript.exe" -e "rmarkdown::render('reports/HW3_multi_omics_report.Rmd')"
+```
+
+## Required R Packages
+
+The report uses:
+
+```text
+data.table
+ggplot2
+GenomicRanges
+rtracklayer
+TxDb.Hsapiens.UCSC.hg19.knownGene
+org.Hs.eg.db
+AnnotationDbi
+clusterProfiler
+EnrichedHeatmap
+ComplexHeatmap
+circlize
+grid
+```
+
+## Notes
+
+The final HTML report is the main file to submit or inspect. The generated figures and screenshots are kept separately in `results/` so that the important visual outputs can also be checked outside the HTML file.
