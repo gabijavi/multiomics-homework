@@ -1,0 +1,642 @@
+---
+title: "HW3: Multi-omics integration of expression, DNA methylation, and chromatin state"
+author: "Gabija Vidrinskaitė"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 11, fig.height = 6)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+library(data.table)
+library(ggplot2)
+library(GenomicRanges)
+library(rtracklayer)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(EnrichedHeatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+dir.create("results", showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+paths <- list(
+  deg = "DATA/DEG_All_Genes.csv",
+  vst = "DATA/VST_data.csv",
+  dmr = "DATA/dmr.bed",
+  cgi = "DATA/CGI_hg19",
+  chromhmm = "DATA/E079_15_coreMarks_mnemonics.bed.gz",
+  h3k27ac_peaks = "DATA/ENCFF646OKL.bed.gz",
+  h3k27me3_peaks = "DATA/ENCFF179UDS.bed.gz",
+  h3k27ac_bw = "DATA/ENCFF075TZQ.bigWig",
+  h3k27me3_bw = "DATA/ENCFF937OKW.bigWig",
+  meth_N2 = "DATA/GSM4505857_N2_CpG_methylation.bed.gz",
+  meth_N12 = "DATA/GSM4505863_N12_CpG_methylation.bed.gz",
+  meth_T2 = "DATA/GSM4505867_T2_CpG_methylation.bed.gz",
+  meth_T12 = "DATA/GSM4505873_T12_CpG_methylation.bed.gz"
+)
+```
+
+## Background and provided data
+
+**Question.** What data were provided for this homework?
+
+**Answer.** The analysis uses the supplied files in the `DATA` folder:
+
+1. Transcriptomics data: `DEG_All_Genes.csv` and `VST_data.csv`.
+2. DMRs: `dmr.bed`.
+3. CpG methylation beta-value files for four samples: `N2`, `N12`, `T2`, and `T12`.
+4. H3K27me3 ENCODE peak and signal files.
+5. H3K27ac ENCODE peak and signal files.
+6. CpG island coordinates: `CGI_hg19`.
+
+The H3K27ac/H3K27me3 file mapping was checked by comparing signal over the two peak files. `ENCFF075TZQ.bigWig` gives strong average signal over `ENCFF646OKL` peaks, so it is used as H3K27ac. `ENCFF937OKW.bigWig` gives strong average signal over `ENCFF179UDS` peaks, so it is used as H3K27me3.
+
+No ATAC-seq bigWig was present in the supplied `DATA` folder. Therefore, the ATAC track requested in the task cannot be shown directly from the provided data. For the browser-style locus plots I show H3K27ac, H3K27me3, DMRs, genes, and the supplied Roadmap/ChromHMM state track (`E079_15_coreMarks_mnemonics.bed.gz`) as a regulatory-state proxy.
+
+## Biological question
+
+**Question.** Do hypermethylated DMRs in ESCC occur at normally active regulatory elements marked by H3K27ac?
+
+**Answer.** Yes. The overlap analysis below finds a substantial subset of hypermethylated DMRs overlapping normal-tissue H3K27ac peaks. This means that some tumour hypermethylation events occur at regions that are normally active regulatory elements. The first IGV screenshot shows one example near a significantly downregulated gene.
+
+**Question.** Do hypermethylated DMRs in ESCC occur at regions already marked as repressed by H3K27me3?
+
+**Answer.** Yes. A smaller, but clear, subset of hypermethylated DMRs overlaps normal-tissue H3K27me3 peaks. This supports a second mechanism where ESCC hypermethylation reinforces pre-existing repression rather than only silencing active elements. The second IGV screenshot shows this different pattern.
+
+**Question.** Do nearby genes show concordant expression changes, and do they converge on pathways?
+
+**Answer.** Yes, there is concordance for a subset of loci: many H3K27ac-overlapping hypermethylated DMRs have a nearby significantly downregulated gene within 50 kb. I also test pathway convergence using GO Biological Process enrichment for these nearby downregulated genes. The enrichment results are shown as both a table and a graph below, after the genomic objects are created.
+
+## Actual assignment: 1. Data inspection and setup
+
+**Question.** Before any analysis, inspect all provided files. How many genes are in the expression matrix? How many CpGs are in the methylation matrix? How many DMRs were provided? How many H3K27me3 and H3K27ac peaks are there? Report the exact numbers.
+
+```{r counts}
+vst <- fread(paths$vst, showProgress = FALSE)
+deg <- fread(paths$deg, showProgress = FALSE)
+dmr <- fread(paths$dmr, showProgress = FALSE)
+setnames(dmr, c("chr", "start", "end", "L", "value"))
+
+h3k27ac_peaks_dt <- fread(paths$h3k27ac_peaks, showProgress = FALSE)
+h3k27me3_peaks_dt <- fread(paths$h3k27me3_peaks, showProgress = FALSE)
+
+meth_files <- paths[c("meth_N2", "meth_N12", "meth_T2", "meth_T12")]
+meth_counts <- vapply(meth_files, function(f) nrow(fread(f, showProgress = FALSE)), integer(1))
+
+counts <- data.table(
+  item = c(
+    "Genes in VST expression matrix",
+    "CpGs in each methylation matrix",
+    "DMRs",
+    "H3K27ac peaks",
+    "H3K27me3 peaks"
+  ),
+  n = c(
+    nrow(vst),
+    unique(meth_counts)[1],
+    nrow(dmr),
+    nrow(h3k27ac_peaks_dt),
+    nrow(h3k27me3_peaks_dt)
+  )
+)
+counts
+```
+
+**Answer.**
+
+The exact counts are: `r format(nrow(vst), big.mark = ",")` genes, `r format(unique(meth_counts)[1], big.mark = ",")` CpGs per methylation sample, `r format(nrow(dmr), big.mark = ",")` DMRs, `r format(nrow(h3k27ac_peaks_dt), big.mark = ",")` H3K27ac peaks, and `r format(nrow(h3k27me3_peaks_dt), big.mark = ",")` H3K27me3 peaks.
+
+**Question.** Create one boxplot or violin plot showing the distribution of VST expression values per sample. Are all samples roughly comparable? Flag any sample that looks like an outlier and explain your reasoning.
+
+**Graph.**
+
+```{r expression-distribution, fig.height=5}
+expr_long <- melt(vst, id.vars = "V1", variable.name = "sample", value.name = "VST")
+expr_stats <- expr_long[, .(
+  median = median(VST, na.rm = TRUE),
+  iqr = IQR(VST, na.rm = TRUE)
+), by = sample]
+expr_stats[, median_z := (median - mean(median)) / sd(median)]
+expr_stats
+
+ggplot(expr_long, aes(sample, VST)) +
+  geom_violin(fill = "#d7e8f7", colour = "#335c7d", linewidth = 0.25, scale = "width") +
+  geom_boxplot(width = 0.18, outlier.size = 0.2, fill = "white", linewidth = 0.25) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(title = "Distribution of VST expression values per RNA-seq sample",
+       x = "Sample", y = "VST expression")
+```
+
+**Comment.**
+
+The VST expression distributions are broadly comparable. `GSM4505892` has the highest median and widest shift relative to the other RNA-seq samples, so I would flag it for follow-up QC, although it is not extreme enough by this plot alone to remove.
+
+**Question.** Create one boxplot or violin plot showing the distribution of beta values per methylation sample. To make the methylation plot faster, use only 1-2 chromosomes.
+
+**Graph.**
+
+```{r methylation-distribution, fig.height=5}
+read_meth_chr12 <- function(path, sample_name) {
+  x <- fread(path, showProgress = FALSE)
+  setnames(x, c("chr", "start", "end", "beta"))
+  x <- x[chr %in% c("chr1", "chr2")]
+  x[, beta := beta / 100]
+  x[, sample := sample_name]
+  x
+}
+
+meth_chr12 <- rbindlist(list(
+  read_meth_chr12(paths$meth_N2, "N2"),
+  read_meth_chr12(paths$meth_N12, "N12"),
+  read_meth_chr12(paths$meth_T2, "T2"),
+  read_meth_chr12(paths$meth_T12, "T12")
+))
+
+set.seed(7)
+meth_plot <- meth_chr12[, .SD[sample(.N, min(.N, 300000))], by = sample]
+meth_stats <- meth_chr12[, .(
+  n_cpg_chr1_chr2 = .N,
+  median_beta = median(beta, na.rm = TRUE),
+  iqr_beta = IQR(beta, na.rm = TRUE)
+), by = sample]
+meth_stats
+
+ggplot(meth_plot, aes(sample, beta)) +
+  geom_violin(fill = "#eee2bd", colour = "#7a642b", linewidth = 0.25, scale = "width") +
+  geom_boxplot(width = 0.18, outlier.size = 0.2, fill = "white", linewidth = 0.25) +
+  theme_bw(base_size = 11) +
+  labs(title = "Distribution of CpG methylation beta values per sample (chr1 and chr2)",
+       x = "Sample", y = "Beta value")
+```
+
+**Comment.**
+
+The methylation beta distributions on chromosomes 1 and 2 are also broadly comparable. N2 and N12 are healthy samples, while T2 and T12 are tumour samples. The tumour samples show modest distributional shifts, but none of the four samples has a strongly abnormal global beta-value distribution.
+
+## Helper setup for genomic integration
+
+```{r genomic-objects}
+make_gr <- function(dt, chr = "V1", start = "V2", end = "V3") {
+  GRanges(dt[[chr]], IRanges(dt[[start]] + 1, dt[[end]]))
+}
+
+dmr_gr <- GRanges(dmr$chr, IRanges(dmr$start + 1, dmr$end),
+                  value = dmr$value, L = dmr$L)
+h3k27ac_peaks <- make_gr(h3k27ac_peaks_dt)
+h3k27me3_peaks <- make_gr(h3k27me3_peaks_dt)
+
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+gene_gr <- genes(txdb)
+gene_gr <- gene_gr[names(gene_gr) %in% as.character(deg$ENTREZID)]
+
+gene_annot <- data.table(ENTREZID = names(gene_gr))
+gene_annot[, SYMBOL := mapIds(org.Hs.eg.db, ENTREZID, "SYMBOL", "ENTREZID", multiVals = "first")]
+deg[, ENTREZID := as.character(ENTREZID)]
+deg_anno <- merge(deg, gene_annot, by = "ENTREZID", all.x = TRUE)
+
+sig_down <- deg_anno[!is.na(padj) & padj < 0.05 & log2FoldChange < 0]
+sig_up <- deg_anno[!is.na(padj) & padj < 0.05 & log2FoldChange > 0]
+
+cat("Significant downregulated genes:", nrow(sig_down), "\n")
+cat("Significant upregulated genes:", nrow(sig_up), "\n")
+```
+
+## Actual assignment: 4. Multi-omics visualisation
+
+### Genome browser view
+
+The DMR BED `value` is interpreted as tumour-minus-normal methylation difference. Positive values are hypermethylated in tumour and negative values are hypomethylated in tumour.
+
+**Question.** Load the normal-tissue H3K27me3 bigWig, H3K27ac bigWig, ATAC-seq bigWig, and DMR BED file. Navigate to a locus containing a hypermethylated DMR that overlaps an H3K27ac or ATAC peak in normal tissue and where the nearest gene is a significant downregulated DEG. Take a screenshot and describe what you observe.
+
+**Answer.** The provided files contain H3K27me3 and H3K27ac bigWigs, but no ATAC-seq bigWig. I therefore used H3K27ac as the active-regulatory-element mark and included the supplied ChromHMM track as an additional normal-tissue regulatory-state reference. The first selected locus is a hypermethylated DMR overlapping an H3K27ac peak, with a nearby significantly downregulated gene.
+
+```{r choose-loci}
+down_gr <- gene_gr[names(gene_gr) %in% sig_down$ENTREZID]
+up_gr <- gene_gr[names(gene_gr) %in% sig_up$ENTREZID]
+
+hyper_dmr <- dmr_gr[mcols(dmr_gr)$value > 0]
+hypo_dmr <- dmr_gr[mcols(dmr_gr)$value < 0]
+
+hyper_ac <- hyper_dmr[unique(queryHits(findOverlaps(hyper_dmr, h3k27ac_peaks)))]
+nearest_down <- nearest(hyper_ac, down_gr)
+locus1_dt <- data.table(
+  dmr_i = seq_along(hyper_ac),
+  gene_id = names(down_gr)[nearest_down],
+  distance = distance(hyper_ac, down_gr[nearest_down]),
+  dmr_value = mcols(hyper_ac)$value
+)
+locus1_dt <- merge(locus1_dt, sig_down[, .(gene_id = ENTREZID, SYMBOL, log2FoldChange, padj)], by = "gene_id")
+locus1_dt <- locus1_dt[distance < 50000][order(distance, padj)]
+locus1 <- hyper_ac[locus1_dt$dmr_i[1]]
+locus1_gene <- down_gr[locus1_dt$gene_id[1]]
+locus1_info <- locus1_dt[1]
+locus1_info
+
+hyper_me3 <- hyper_dmr[unique(queryHits(findOverlaps(hyper_dmr, h3k27me3_peaks)))]
+nearest_any <- nearest(hyper_me3, gene_gr)
+locus2_dt <- data.table(
+  dmr_i = seq_along(hyper_me3),
+  gene_id = names(gene_gr)[nearest_any],
+  distance = distance(hyper_me3, gene_gr[nearest_any]),
+  dmr_value = mcols(hyper_me3)$value
+)
+locus2_dt <- merge(locus2_dt, deg_anno[, .(gene_id = ENTREZID, SYMBOL, log2FoldChange, padj)], by = "gene_id")
+locus2_dt <- locus2_dt[distance < 50000][order(distance, -dmr_value)]
+locus2 <- hyper_me3[locus2_dt$dmr_i[1]]
+locus2_gene <- gene_gr[locus2_dt$gene_id[1]]
+locus2_info <- locus2_dt[1]
+locus2_info
+```
+
+**Answer to the biological questions: overlap and concordance summary.**
+
+The table below summarizes how many hypermethylated DMRs overlap active H3K27ac peaks or repressive H3K27me3 peaks in normal tissue, and how many of those DMRs have a nearby significantly downregulated gene within 50 kb. Positive DMR `value` is treated as tumour hypermethylation.
+
+```{r biological-summary}
+hyper_ac_hits <- unique(queryHits(findOverlaps(hyper_dmr, h3k27ac_peaks)))
+hyper_me3_hits <- unique(queryHits(findOverlaps(hyper_dmr, h3k27me3_peaks)))
+
+hyper_ac_gr <- hyper_dmr[hyper_ac_hits]
+hyper_me3_gr <- hyper_dmr[hyper_me3_hits]
+
+nearest_gene_for <- function(query_gr, target_gr, target_ids) {
+  ni <- nearest(query_gr, target_gr)
+  data.table(
+    gene_id = target_ids[ni],
+    distance = distance(query_gr, target_gr[ni])
+  )
+}
+
+hyper_ac_nearest_down <- nearest_gene_for(hyper_ac_gr, down_gr, names(down_gr))
+hyper_me3_nearest_down <- nearest_gene_for(hyper_me3_gr, down_gr, names(down_gr))
+
+overlap_summary <- data.table(
+  question = c(
+    "Hypermethylated DMRs overlapping H3K27ac peaks",
+    "Hypermethylated DMRs overlapping H3K27me3 peaks",
+    "H3K27ac-overlapping hyper-DMRs with nearest significant downregulated gene within 50 kb",
+    "H3K27me3-overlapping hyper-DMRs with nearest significant downregulated gene within 50 kb"
+  ),
+  count = c(
+    length(hyper_ac_gr),
+    length(hyper_me3_gr),
+    nrow(hyper_ac_nearest_down[distance <= 50000]),
+    nrow(hyper_me3_nearest_down[distance <= 50000])
+  )
+)
+overlap_summary
+```
+
+**Graph.**
+
+```{r biological-summary-plot, fig.height=4.5, fig.width=10}
+overlap_plot <- copy(overlap_summary)
+overlap_plot[, question := factor(question, levels = rev(question))]
+ggplot(overlap_plot, aes(x = question, y = count)) +
+  geom_col(fill = "#4C78A8", width = 0.7) +
+  geom_text(aes(label = format(count, big.mark = ",")), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Hypermethylated DMR overlap and nearby downregulated gene summary",
+    x = NULL,
+    y = "Number of DMRs"
+  )
+```
+
+**Comment.**
+
+The data contain both patterns requested in the assignment. Some hypermethylated DMRs overlap normal H3K27ac peaks, which is compatible with de novo methylation at normally active regulatory regions. Some hypermethylated DMRs overlap normal H3K27me3 peaks, which is compatible with reinforcement of pre-existing repression.
+
+**Question.** Do genes near active-region hypermethylated DMRs converge on biological pathways?
+
+**Answer.**
+
+The pathway test below uses GO Biological Process enrichment for genes near H3K27ac-overlapping hypermethylated DMRs that are also significantly downregulated. The DEG table genes are used as the background universe.
+
+```{r go-enrichment}
+active_silenced_genes <- unique(hyper_ac_nearest_down[distance <= 50000, gene_id])
+active_silenced_genes <- active_silenced_genes[active_silenced_genes %in% sig_down$ENTREZID]
+universe_genes <- unique(deg_anno$ENTREZID)
+
+if (length(active_silenced_genes) >= 5) {
+  ego <- enrichGO(
+    gene = active_silenced_genes,
+    universe = universe_genes,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  go_table <- as.data.table(ego)[, .(Description, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, geneID)]
+  if (nrow(go_table) > 0) {
+    go_table[1:min(10, nrow(go_table))]
+  } else {
+    data.table(note = "No GO Biological Process terms passed the selected q-value cutoff.")
+  }
+} else {
+  go_table <- data.table(note = "Fewer than five active-silenced genes were available for GO enrichment.")
+  go_table
+}
+```
+
+**Graph.**
+
+```{r go-enrichment-plot, fig.height=6, fig.width=10}
+if (exists("go_table") && "Description" %in% names(go_table) && nrow(go_table) > 0) {
+  go_plot <- go_table[1:min(10, .N)]
+  go_plot[, Description := factor(Description, levels = rev(Description))]
+  ggplot(go_plot, aes(x = Description, y = -log10(p.adjust))) +
+    geom_col(fill = "#4169E1", width = 0.75) +
+    coord_flip() +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "GO Biological Process enrichment for active-region hypermethylated DMR genes",
+      x = "GO Biological Process term",
+      y = "-log10(adjusted p-value)"
+    )
+} else {
+  plot.new()
+  text(0.5, 0.5, "No GO terms passed the selected cutoff.")
+}
+```
+
+**Comment.**
+
+The GO enrichment table and plot provide the pathway/convergence part of the biological question. In this dataset, genes near H3K27ac-overlapping hypermethylated DMRs and downregulated in tumour are enriched for processes including actin filament regulation, sodium ion transport, intermediate filament/cytoskeleton organization, organic acid catabolism, and muscle system processes. This suggests that the affected genes are not random: they converge on structural, transport, and metabolic biological functions. The enrichment should still be interpreted as exploratory, because the assignment input does not include a separate curated pathway database beyond gene annotations.
+
+```{r igv-batch-code}
+igv_loci <- fread("results/igv/igv_loci.tsv")
+igv_loci
+
+cat(readLines("results/igv/hw3_igv_batch.txt"), sep = "\n")
+```
+
+**Graph.**
+
+```{r locus-1, echo=FALSE, out.width='100%'}
+knitr::include_graphics("results/igv/igv_locus1_active_hyper_down_fixed.png")
+```
+
+**Comment.**
+
+At this locus the DMR is hypermethylated in tumour and overlaps a normal H3K27ac peak, while the nearest significant DEG is downregulated. This pattern supports the model that ESCC can gain methylation at normally active regulatory regions and reduce expression of nearby genes.
+
+**Question.** Navigate to a second locus that shows a different or unexpected pattern, for example a hypermethylated DMR at an H3K27me3 region or a hypomethylated DMR at an ATAC peak. Take an annotated screenshot and describe what you observe.
+
+**Answer.** The second selected locus shows a hypermethylated DMR overlapping a normal-tissue H3K27me3 peak. This is different from the first active-element example because H3K27me3 is a repressive Polycomb-associated mark.
+
+**Graph.**
+
+```{r locus-2, echo=FALSE, out.width='100%'}
+knitr::include_graphics("results/igv/igv_locus2_repressed_hyper_fixed.png")
+```
+
+**Comment.**
+
+The second locus shows a hypermethylated DMR associated with normal H3K27me3 signal. This is a different pattern from active-element silencing: it is more consistent with reinforcement of a region that was already repressed or Polycomb-marked in normal tissue.
+
+### EnrichedHeatmap: chromatin signal at strongly changing genes
+
+**Question.** Use the EnrichedHeatmap package to create one figure centered on differentially expressed genes with expression change of 3-fold or more and adjusted p-value below 0.01. Extend 3 kb on each side. Include H3K27ac signal, H3K27ac peak density, H3K27me3 signal, H3K27me3 peak density, methylation signal, promoter methylation annotations for one healthy and one cancer sample, and log2FC.
+
+**Answer.** The figure below follows the requested panel order: H3K27ac signal, H3K27ac peak density, H3K27me3 signal, H3K27me3 peak density, healthy methylation signal, tumour methylation signal, healthy promoter mean methylation, tumour promoter mean methylation, and log2FC. The heatmap is normalized over the gene body with 3 kb flanks, so the dashed vertical lines mark gene start and gene end. Rows are split into upregulated and downregulated genes; therefore the top enriched profiles show two lines. The requested colour scales are kept: H3K27ac signal is white to dark green, H3K27me3 signal is white to dark blue, and log2FC is blue to white to red centered at zero.
+
+Genes were selected using a fold change of at least 3-fold (`abs(log2FC) >= log2(3)`) and adjusted p-value below 0.01. The selected set is large, so this report plots a balanced subset of the strongest 800 genes by adjusted p-value (or all selected genes if fewer than 800), which satisfies the assignment instruction to provide the complete figure or a representative part.
+
+```{r enriched-heatmap-data}
+strong_deg <- deg_anno[!is.na(padj) & padj < 0.01 & abs(log2FoldChange) >= log2(3)]
+strong_deg <- strong_deg[ENTREZID %in% names(gene_gr)]
+strong_deg[, direction := fifelse(log2FoldChange > 0, "Upregulated", "Downregulated")]
+
+plot_deg <- rbind(
+  strong_deg[direction == "Downregulated"][order(padj)][1:min(400, .N)],
+  strong_deg[direction == "Upregulated"][order(padj)][1:min(400, .N)]
+)
+plot_deg <- plot_deg[order(log2FoldChange)]
+
+plot_genes <- gene_gr[plot_deg$ENTREZID]
+names(plot_genes) <- plot_deg$ENTREZID
+tss <- promoters(plot_genes, upstream = 0, downstream = 1)
+names(tss) <- plot_deg$ENTREZID
+promoters_2kb <- promoters(plot_genes, upstream = 1000, downstream = 1000)
+names(promoters_2kb) <- plot_deg$ENTREZID
+
+cat("All strong genes:", nrow(strong_deg), "\n")
+cat("Genes plotted:", nrow(plot_deg), "\n")
+```
+
+**Graph.**
+
+```{r enriched-heatmap, fig.width=18, fig.height=9}
+signal_window <- trim(resize(plot_genes, width = width(plot_genes) + 6000, fix = "center"))
+
+ac_signal <- import(paths$h3k27ac_bw, which = signal_window)
+me3_signal <- import(paths$h3k27me3_bw, which = signal_window)
+
+mat_ac <- normalizeToMatrix(ac_signal, plot_genes, value_column = "score",
+                            extend = 3000, w = 100, mean_mode = "w0",
+                            background = 0)
+mat_me3 <- normalizeToMatrix(me3_signal, plot_genes, value_column = "score",
+                             extend = 3000, w = 100, mean_mode = "w0",
+                             background = 0)
+mat_ac_peaks <- normalizeToMatrix(h3k27ac_peaks, plot_genes,
+                                  extend = 3000, w = 100, mean_mode = "w0",
+                                  background = 0)
+mat_me3_peaks <- normalizeToMatrix(h3k27me3_peaks, plot_genes,
+                                   extend = 3000, w = 100, mean_mode = "w0",
+                                   background = 0)
+
+read_meth_gr <- function(path, sample_name) {
+  x <- fread(path, showProgress = FALSE)
+  setnames(x, c("chr", "start", "end", "beta"))
+  x[, beta := beta / 100]
+  gr <- GRanges(x$chr, IRanges(x$start + 1, x$end), beta = x$beta)
+  gr
+}
+
+meth_N2_gr <- read_meth_gr(paths$meth_N2, "N2")
+meth_T2_gr <- read_meth_gr(paths$meth_T2, "T2")
+
+mat_N2 <- normalizeToMatrix(meth_N2_gr, plot_genes, value_column = "beta",
+                            extend = 3000, w = 100, mean_mode = "absolute",
+                            background = NA)
+mat_T2 <- normalizeToMatrix(meth_T2_gr, plot_genes, value_column = "beta",
+                            extend = 3000, w = 100, mean_mode = "absolute",
+                            background = NA)
+
+promoter_mean <- function(cpg_gr, prom_gr) {
+  hits <- findOverlaps(prom_gr, cpg_gr)
+  out <- rep(NA_real_, length(prom_gr))
+  if (length(hits)) {
+    tmp <- data.table(q = queryHits(hits), beta = mcols(cpg_gr)$beta[subjectHits(hits)])
+    means <- tmp[, .(mean_beta = mean(beta, na.rm = TRUE)), by = q]
+    out[means$q] <- means$mean_beta
+  }
+  out
+}
+
+prom_N2 <- promoter_mean(meth_N2_gr, promoters_2kb)
+prom_T2 <- promoter_mean(meth_T2_gr, promoters_2kb)
+
+row_order <- order(plot_deg$log2FoldChange)
+mat_ac <- mat_ac[row_order, ]
+mat_ac_peaks <- mat_ac_peaks[row_order, ]
+mat_me3 <- mat_me3[row_order, ]
+mat_me3_peaks <- mat_me3_peaks[row_order, ]
+mat_N2 <- mat_N2[row_order, ]
+mat_T2 <- mat_T2[row_order, ]
+plot_deg_ord <- plot_deg[row_order]
+prom_N2 <- prom_N2[row_order]
+prom_T2 <- prom_T2[row_order]
+
+prom_N2_mat <- matrix(prom_N2, ncol = 1)
+prom_T2_mat <- matrix(prom_T2, ncol = 1)
+log2fc_mat <- matrix(plot_deg_ord$log2FoldChange, ncol = 1)
+row_split <- factor(plot_deg_ord$direction, levels = c("Upregulated", "Downregulated"))
+max_abs_lfc <- max(abs(plot_deg_ord$log2FoldChange), na.rm = TRUE)
+
+title_gp <- gpar(fontsize = 10, fontface = "bold")
+legend_gp <- gpar(fontsize = 16, fontface = "bold")
+legend_label_gp <- gpar(fontsize = 14)
+legend_param <- function(title) {
+  list(title = title, title_gp = legend_gp, labels_gp = legend_label_gp)
+}
+
+ht <- EnrichedHeatmap(
+  mat_ac,
+  name = "H3K27ac signal",
+  column_title = "Panel 1\nH3K27ac signal",
+  column_title_gp = title_gp,
+  split = row_split,
+  col = colorRamp2(c(0, quantile(mat_ac, 0.99, na.rm = TRUE)), c("white", "#006400")),
+  heatmap_legend_param = legend_param("H3K27ac signal"),
+  top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+) +
+  EnrichedHeatmap(
+    mat_ac_peaks,
+    name = "H3K27ac peaks",
+    column_title = "Panel 2\nH3K27ac peaks",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 1), c("white", "#006400")),
+    heatmap_legend_param = legend_param("H3K27ac peaks"),
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+  ) +
+  EnrichedHeatmap(
+    mat_me3,
+    name = "H3K27me3 signal",
+    column_title = "Panel 3\nH3K27me3 signal",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, quantile(mat_me3, 0.99, na.rm = TRUE)), c("white", "#00008B")),
+    heatmap_legend_param = legend_param("H3K27me3 signal"),
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+  ) +
+  EnrichedHeatmap(
+    mat_me3_peaks,
+    name = "H3K27me3 peaks",
+    column_title = "Panel 4\nH3K27me3 peaks",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 1), c("white", "#00008B")),
+    heatmap_legend_param = legend_param("H3K27me3 peaks"),
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+  ) +
+  EnrichedHeatmap(
+    mat_N2,
+    name = "Healthy methylation",
+    column_title = "Panel 5\nMethylation\nhealthy N2",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 0.5, 1), c("blue", "white", "red")),
+    heatmap_legend_param = legend_param("Healthy methylation"),
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+  ) +
+  EnrichedHeatmap(
+    mat_T2,
+    name = "Cancer methylation",
+    column_title = "Panel 6\nMethylation\ncancer T2",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 0.5, 1), c("blue", "white", "red")),
+    heatmap_legend_param = legend_param("Cancer methylation"),
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = c("red", "blue"), lwd = 1.5)))
+  ) +
+  Heatmap(
+    prom_N2_mat,
+    name = "N2 promoter",
+    column_title = "P7\nN2 promoter",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 0.5, 1), c("white", "#d9b65d", "#7f4f00")),
+    heatmap_legend_param = legend_param("N2 promoter"),
+    width = unit(12, "mm"),
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE
+  ) +
+  Heatmap(
+    prom_T2_mat,
+    name = "T2 promoter",
+    column_title = "P8\nT2 promoter",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(0, 0.5, 1), c("white", "#d9b65d", "#7f4f00")),
+    heatmap_legend_param = legend_param("T2 promoter"),
+    width = unit(12, "mm"),
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE
+  ) +
+  Heatmap(
+    log2fc_mat,
+    name = "log2FC",
+    column_title = "P9\nlog2FC",
+    column_title_gp = title_gp,
+    split = row_split,
+    col = colorRamp2(c(-max_abs_lfc, 0, max_abs_lfc), c("blue", "white", "red")),
+    heatmap_legend_param = legend_param("log2FC"),
+    width = unit(12, "mm"),
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE
+  )
+
+png("results/figures/enriched_heatmap_multomics.png", width = 3200, height = 1700, res = 180)
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right",
+     row_title_gp = gpar(fontsize = 16, fontface = "bold"))
+dev.off()
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right",
+     row_title_gp = gpar(fontsize = 16, fontface = "bold"))
+```
+
+**Comment.**
+
+The strongest downregulated genes tend to have more repressive chromatin context, including visible H3K27me3 signal and higher tumour methylation in promoter-centered windows. The strongest upregulated genes are more often found near H3K27ac signal or active/transcribed chromatin contexts and have less evidence of Polycomb-associated repression. Overall, the combined view supports two mechanisms: methylation of normally active regulatory regions near downregulated genes, and methylation reinforcement at already repressed H3K27me3-marked loci.
+
+## Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
